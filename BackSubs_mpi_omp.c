@@ -229,30 +229,36 @@ int main(int argc, char *argv[]) {
     unsigned segment_to_be_updated = FACTOR;
     fp_t mem;
 
-    for (int i = FACTOR - 1; i >= 0; --i) {
-        for (int p = 0; p < numprocs; ++p) {
-            if (myid == actual_proc) {
-                unsigned offset_i = i * lines;
-                for (int j = lines - 1; j >= 0; --j) {
-                    mem_B[offset_i + j] = mem_B[offset_i + j] / mem_A[i * block_size + j * size + global_index + j];
-                    MPI_Bcast(&mem_B[offset_i + j], 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-                    for (int k = offset_i + j - 1; k >= 0; --k) {
-                        mem_B[k] -= mem_B[offset_i + j] * mem_A[k * size + global_index + j];
+#pragma omp parallel
+    {
+        for (int i = FACTOR - 1; i >= 0; --i) {
+            for (int p = 0; p < numprocs; ++p) {
+                if (myid == actual_proc) {
+                    unsigned offset_i = i * lines;
+                    for (int j = lines - 1; j >= 0; --j) {
+                        mem_B[offset_i + j] = mem_B[offset_i + j] / mem_A[i * block_size + j * size + global_index + j];
+                        fp_t new_x = mem_B[offset_i + j];
+                        MPI_Bcast(&new_x, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
+#pragma omp for
+                        for (int k = offset_i + j - 1; k >= 0; --k) {
+                            mem_B[k] -= new_x * mem_A[k * size + global_index + j];
+                        }
+                        if (myid == 0) B[global_index + j] = mem_B[offset_i + j];
                     }
-                    if (myid == 0) B[global_index + j] = mem_B[offset_i + j];
-                }
-                segment_to_be_updated--;
-            } else {
-                for (int j = lines - 1; j >= 0; --j) {
-                    MPI_Bcast(&mem, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-                    for (int k = segment_to_be_updated * lines - 1; k >= 0; --k) {
-                        mem_B[k] -= mem * mem_A[k * size + global_index + j];
+                    segment_to_be_updated--;
+                } else {
+                    for (int j = lines - 1; j >= 0; --j) {
+                        MPI_Bcast(&mem, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
+#pragma omp for
+                        for (int k = segment_to_be_updated * lines - 1; k >= 0; --k) {
+                            mem_B[k] -= mem * mem_A[k * size + global_index + j];
+                        }
+                        if (myid == 0) B[global_index + j] = mem;
                     }
-                    if (myid == 0) B[global_index + j] = mem;
                 }
+                actual_proc = (actual_proc + 1) % numprocs;
+                global_index -= lines;
             }
-            actual_proc = (actual_proc + 1) % numprocs;
-            global_index -= lines;
         }
     }
 
