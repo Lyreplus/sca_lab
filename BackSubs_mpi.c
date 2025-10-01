@@ -87,8 +87,8 @@ void print_matrix_vector(double A[SIZE][SIZE], double B[SIZE]) {
 }
 
 // Function to print the 4x4 matrix A and the 4-element vector B side-by-side
-void print_matrix_vector_fake(double A[2][SIZE], double B[2]) {
-    printf("--- 2x4 Matrix (A) | 2-Element Vector (B) ---\n");
+void print_matrix_vector_fake(int id, double A[2][SIZE], double B[2]) {
+    printf("--- id: %d | 2x4 Matrix (A) | 2-Element Vector (B) ---\n", id);
 
     // Outer loop for rows (0 to 3)
     for (int i = 0; i < 2; i++) {
@@ -174,21 +174,23 @@ int main(int argc, char *argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
     MPI_Comm_rank(MPI_COMM_WORLD, &myid);
 
+    int FACTOR = 2;
+
+    if (numprocs < 2 || size % (FACTOR * numprocs)) MPI_Abort(MPI_COMM_WORLD, 1);
+
     if (myid == 0) {  // Only Id 0 creates the matrix to share it
         if (trsm_setup(check, m, n, b, lda, ldb, &A, &B, &Bchk)) {
             fprintf(stderr, "err: allocating matrix\n");
             return 2;
         }
-        print_matrix_vector(A, B);
     }
 
     // distribuzione carico
     // TODO non gestisco il resto
-    int FACTOR = 2;
 
     int factor_processes = FACTOR * numprocs;
     int lines = size / factor_processes;
-    int block_size = lines * m;
+    int block_size = lines * size;
 
     fp_t *mem_A = malloc(FACTOR * block_size * sizeof(fp_t));
     fp_t *mem_B = malloc(FACTOR * lines * sizeof(fp_t));
@@ -212,8 +214,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    print_matrix_vector_fake(mem_A, mem_B);
-
     // a questo punto tutti i processi hanno
     // mem_A = (FACTOR * block_size) coefficienti
     // mem_B = (FACTOR * lines) controvalori
@@ -223,42 +223,44 @@ int main(int argc, char *argv[]) {
     if (myid == 0) START_COUNT_TIME;
 
     // la computazione effettiva comincia da proc 1 così finisce in proc 0
-    if (numprocs < 2) MPI_Abort(MPI_COMM_WORLD, 1);
 
     int actual_proc = 1;
+    unsigned global_index = size - lines;
+    unsigned segment_to_be_updated = FACTOR;
     fp_t mem;
 
     for (int i = FACTOR - 1; i >= 0; --i) {
         for (int p = 0; p < numprocs; ++p) {
             if (myid == actual_proc) {
+                unsigned offset_i = i * lines;
                 for (int j = lines - 1; j >= 0; --j) {
-                    printf("%d | %f | %f - %lld %lld\n", myid, mem_B[i * lines + j], mem_A[i * block_size + j * m + size - 1 - j], i * lines + j, i * block_size + j * size + size - 1 - j);
-                    mem_B[i * lines + j] = mem_B[i * lines + j] / mem_A[i * block_size + j * m + size - 1 - j];
-                    MPI_Bcast(&mem_B[i * lines + j], 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-                    for (int k = j - 1; k >= 0; --k) {
-                        mem_B[i * lines + k] = mem_B[i * lines + k] - mem_B[i * lines + j] * mem_A[i * block_size + k * m + j];
+                    mem_B[offset_i + j] = mem_B[offset_i + j] / mem_A[i * block_size + j * size + global_index + j];
+                    MPI_Bcast(&mem_B[offset_i + j], 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
+                    for (int k = offset_i + j - 1; k >= 0; --k) {
+                        mem_B[k] -= mem_B[offset_i + j] * mem_A[k * size + global_index + j];
                     }
+                    if (myid == 0) B[global_index + j] = mem_B[offset_i + j];
                 }
+                segment_to_be_updated--;
             } else {
                 for (int j = lines - 1; j >= 0; --j) {
                     MPI_Bcast(&mem, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-                    for (int k = j - 1; k >= 0; --k) {
-                        mem_B[i * lines + k] = mem_B[i * lines + k] - mem * mem_A[i * block_size + k * m + j];
+                    for (int k = segment_to_be_updated * lines - 1; k >= 0; --k) {
+                        mem_B[k] -= mem * mem_A[k * size + global_index + j];
                     }
+                    if (myid == 0) B[global_index + j] = mem;
                 }
             }
             actual_proc = (actual_proc + 1) % numprocs;
+            global_index -= lines;
         }
     }
-    printf("%d [ ", myid);
-    for (int j = 0; j < lines * FACTOR; ++j) printf("%f ", mem_B[j]);
-    printf("]\n");
 
     if (myid == 0) {
         STOP_COUNT_TIME("");
     }
 
-    if (myid == 10) {
+    if (myid == 0) {
         if (size <= 1000) {
             if (size <= 10) {  // Simple printing code for debug purposes
                 for (int i = 0; i < lda; ++i) {
