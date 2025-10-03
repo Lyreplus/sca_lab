@@ -67,7 +67,8 @@ fp_t *A;
 fp_t *B;
 fp_t *Bchk;
 
-#define SIZE 4
+#define SIZE 8
+#define SIZE1 4
 
 // Function to print the 4x4 matrix A and the 4-element vector B side-by-side
 void print_matrix_vector(double A[SIZE][SIZE], double B[SIZE]) {
@@ -87,11 +88,11 @@ void print_matrix_vector(double A[SIZE][SIZE], double B[SIZE]) {
 }
 
 // Function to print the 4x4 matrix A and the 4-element vector B side-by-side
-void print_matrix_vector_fake(int id, double A[2][SIZE], double B[2]) {
+void print_matrix_vector_fake(int id, double A[SIZE1][SIZE], double B[SIZE1]) {
     printf("--- id: %d | 2x4 Matrix (A) | 2-Element Vector (B) ---\n", id);
 
     // Outer loop for rows (0 to 3)
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < SIZE1; i++) {
         // 1. Print Matrix A row
         for (int j = 0; j < SIZE; j++) {
             // %8.3f for formatted output (total width 8, 3 decimal places)
@@ -174,9 +175,11 @@ int main(int argc, char *argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
     MPI_Comm_rank(MPI_COMM_WORLD, &myid);
 
+    // 12000 = 2*2*3 *2*5 *2*5 *2*5 = 2^5 * 3 * 5 ^3
     int FACTOR = 2;
+    int PARTITION = 1;
 
-    if (numprocs < 2 || size % (FACTOR * numprocs)) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (numprocs < 2 || size % (FACTOR * PARTITION * numprocs)) MPI_Abort(MPI_COMM_WORLD, 1);
 
     if (myid == 0) {  // Only Id 0 creates the matrix to share it
         if (trsm_setup(check, m, n, b, lda, ldb, &A, &B, &Bchk)) {
@@ -189,27 +192,27 @@ int main(int argc, char *argv[]) {
     // TODO non gestisco il resto
 
     int factor_processes = FACTOR * numprocs;
-    int lines = size / factor_processes;
-    int block_size = lines * size;
+    int lines_factor = size / factor_processes;
+    int block_size = lines_factor * size;
 
     fp_t *mem_A = malloc(FACTOR * block_size * sizeof(fp_t));
-    fp_t *mem_B = malloc(FACTOR * lines * sizeof(fp_t));
+    fp_t *mem_B = malloc(FACTOR * lines_factor * sizeof(fp_t));
 
     if (myid) {
         for (int i = FACTOR - 1; i >= 0; --i) {
             MPI_Recv(&mem_A[i * block_size], block_size, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
-            MPI_Recv(&mem_B[i * lines], lines, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
+            MPI_Recv(&mem_B[i * lines_factor], lines_factor, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status);
         }
     } else {
-        for (int i = size - lines, recipient = 1; i >= 0; i -= lines, recipient++) {
+        for (int i = size - lines_factor, recipient = 0; i >= 0; i -= lines_factor, recipient++) {
             int dest = recipient % numprocs;
             if (dest != 0) {
                 MPI_Send(&A[i * size], block_size, MPI_DOUBLE, dest, 0, MPI_COMM_WORLD);
-                MPI_Send(&B[i], lines, MPI_DOUBLE, dest, 0, MPI_COMM_WORLD);
+                MPI_Send(&B[i], lines_factor, MPI_DOUBLE, dest, 0, MPI_COMM_WORLD);
             } else {
-                int j = FACTOR - recipient / numprocs;
+                int j = FACTOR - recipient / numprocs - 1;
                 memcpy(&mem_A[j * block_size], &A[i * size], block_size * sizeof(fp_t));
-                memcpy(&mem_B[j * lines], &B[i], lines * sizeof(fp_t));
+                memcpy(&mem_B[j * lines_factor], &B[i], lines_factor * sizeof(fp_t));
             }
         }
     }
@@ -224,40 +227,51 @@ int main(int argc, char *argv[]) {
 
     // la computazione effettiva comincia da proc 1 così finisce in proc 0
 
-    int actual_proc = 1;
-    unsigned global_index = size - lines;
-    unsigned segment_to_be_updated = FACTOR;
-    fp_t mem;
+    int global_index = size, starting_point, segment_to_update = FACTOR;
+    fp_t *ptr, *tmp_mem = malloc(PARTITION * sizeof(fp_t));
 
 #pragma omp parallel
     {
-        for (int i = FACTOR - 1; i >= 0; --i) {
-            for (int p = 0; p < numprocs; ++p) {
-                if (myid == actual_proc) {
-                    unsigned offset_i = i * lines;
-                    for (int j = lines - 1; j >= 0; --j) {
-                        mem_B[offset_i + j] = mem_B[offset_i + j] / mem_A[i * block_size + j * size + global_index + j];
-                        fp_t new_x = mem_B[offset_i + j];
-                        MPI_Bcast(&new_x, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-#pragma omp for
-                        for (int k = offset_i + j - 1; k >= 0; --k) {
-                            mem_B[k] -= new_x * mem_A[k * size + global_index + j];
+        for (int i = FACTOR - 1; i >= 0; i--) {
+            // Factor elems
+            for (int p = 0; p < numprocs; p++) {
+                // each process does his thing
+                for (int j = lines_factor - PARTITION; j >= 0; j -= PARTITION) {
+// Partition of the factor
+#pragma omp single
+                    {
+                        global_index -= PARTITION;
+                        if (myid == p) {
+                            int index_A = (i * lines_factor + j) * size + global_index;
+                            int index_B = i * lines_factor + j;
+                            for (int k = PARTITION - 1; k >= 0; k--) {
+                                // single elem inside the partition
+                                mem_B[index_B + k] /= mem_A[index_A + k];
+                                // update inside the partition
+                                for (int l = index_B + k - 1; l >= index_B; l--) {
+                                    mem_B[l] -= mem_B[index_B + k] * mem_A[l * size + global_index + k];
+                                }
+                            }
+                            ptr = &mem_B[index_B];
+                            starting_point = index_B - 1;
+                            segment_to_update--;
+                        } else {
+                            starting_point = segment_to_update * lines_factor - 1;
+                            ptr = tmp_mem;
                         }
-                        if (myid == 0) B[global_index + j] = mem_B[offset_i + j];
+                        MPI_Bcast(ptr, PARTITION, MPI_DOUBLE, p, MPI_COMM_WORLD);
+                        if (!myid) memcpy(&B[global_index], ptr, PARTITION * sizeof(fp_t));
+                        // print_matrix_vector_fake(myid, mem_A, mem_B);
                     }
-                    segment_to_be_updated--;
-                } else {
-                    for (int j = lines - 1; j >= 0; --j) {
-                        MPI_Bcast(&mem, 1, MPI_DOUBLE, actual_proc, MPI_COMM_WORLD);
-#pragma omp for
-                        for (int k = segment_to_be_updated * lines - 1; k >= 0; --k) {
-                            mem_B[k] -= mem * mem_A[k * size + global_index + j];
+#pragma omp for collapse(2)
+                    for (int k = PARTITION - 1; k >= 0; k--) {
+                        // each new x found
+                        for (int l = starting_point; l >= 0; l--) {
+                            // each row
+                            mem_B[l] -= ptr[k] * mem_A[l * size + global_index + k];
                         }
-                        if (myid == 0) B[global_index + j] = mem;
                     }
                 }
-                actual_proc = (actual_proc + 1) % numprocs;
-                global_index -= lines;
             }
         }
     }
@@ -299,6 +313,7 @@ int main(int argc, char *argv[]) {
     // free
     free(mem_A);
     free(mem_B);
+    free(tmp_mem);
 
     MPI_Finalize();
 
