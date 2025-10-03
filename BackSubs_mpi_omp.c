@@ -177,15 +177,16 @@ int main(int argc, char *argv[]) {
 
     // 12000 = 2*2*3 *2*5 *2*5 *2*5 = 2^5 * 3 * 5 ^3
     int FACTOR = 2;
-    int PARTITION = 1;
+    int PARTITION = 2;
 
-    if (numprocs < 2 || size % (FACTOR * PARTITION * numprocs)) MPI_Abort(MPI_COMM_WORLD, 1);
+    if (size % (FACTOR * PARTITION * numprocs)) MPI_Abort(MPI_COMM_WORLD, 1);
 
     if (myid == 0) {  // Only Id 0 creates the matrix to share it
         if (trsm_setup(check, m, n, b, lda, ldb, &A, &B, &Bchk)) {
             fprintf(stderr, "err: allocating matrix\n");
             return 2;
         }
+        // print_matrix_vector(A, B);
     }
 
     // distribuzione carico
@@ -245,9 +246,10 @@ int main(int argc, char *argv[]) {
                             int index_A = (i * lines_factor + j) * size + global_index;
                             int index_B = i * lines_factor + j;
                             for (int k = PARTITION - 1; k >= 0; k--) {
-                                // single elem inside the partition
-                                mem_B[index_B + k] /= mem_A[index_A + k];
-                                // update inside the partition
+                                // printf("%d | %d %d - %d %d\n", p, j, myid, index_B + k, index_A + k * size + k);
+                                // each pivot inside the partition
+                                mem_B[index_B + k] /= mem_A[index_A + k * size + k];
+                                // update newt lines inside the partition
                                 for (int l = index_B + k - 1; l >= index_B; l--) {
                                     mem_B[l] -= mem_B[index_B + k] * mem_A[l * size + global_index + k];
                                 }
@@ -259,7 +261,9 @@ int main(int argc, char *argv[]) {
                             starting_point = segment_to_update * lines_factor - 1;
                             ptr = tmp_mem;
                         }
+                        // bcast new x found
                         MPI_Bcast(ptr, PARTITION, MPI_DOUBLE, p, MPI_COMM_WORLD);
+                        // update original B
                         if (!myid) memcpy(&B[global_index], ptr, PARTITION * sizeof(fp_t));
                         // print_matrix_vector_fake(myid, mem_A, mem_B);
                     }
